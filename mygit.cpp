@@ -462,19 +462,98 @@ string buildTreeFromIndex(const vector<IndexEntry>& index) {
     return root.write();
 }
 
+// ─────────────────────────────────────────────
+// Flatten a committed tree back into index-style
+// entries so we can merge it with staged changes.
+// ─────────────────────────────────────────────
+void flattenTree(const string& treeHash,
+                 const string& prefix,
+                 vector<IndexEntry>& out) {
+    auto data = readObject(treeHash);
+    if (data.empty()) return;
+
+    // skip header
+    size_t idx = 0;
+    while (idx < data.size() && data[idx] != '\0') idx++;
+    idx++;
+
+    while (idx < data.size()) {
+        string mode;
+        while (idx < data.size() && data[idx] != ' ')
+            mode += (char)data[idx++];
+        idx++;
+
+        string name;
+        while (idx < data.size() && data[idx] != '\0')
+            name += (char)data[idx++];
+        idx++;
+
+        if (idx + SHA_DIGEST_LENGTH > data.size()) break;
+        string entryHash = bytesToHex(&data[idx]);
+        idx += SHA_DIGEST_LENGTH;
+
+        string fullPath = prefix.empty() ? name : prefix + "/" + name;
+
+        if (mode == "40000") {
+            // recurse into subtree
+            flattenTree(entryHash, fullPath, out);
+        } else {
+            out.push_back({ entryHash, fullPath });
+        }
+    }
+}
+
 void mygitCommit(const string& message) {
-    auto index = readIndex();
-    if (index.empty()) {
+    auto stagedIndex = readIndex();
+    if (stagedIndex.empty()) {
         cerr << "Nothing to commit. Use 'mygit add <file>' first.\n";
         return;
     }
 
-    // FIX: build tree from STAGED files, not entire working directory
-    string treeHash = buildTreeFromIndex(index);
-    if (treeHash.empty()) { cerr << "Error: failed to build tree.\n"; return; }
+    // ── Merge staged changes with previously committed files ──────────────
+    // Start from the full file list of the last commit (if any), then
+    // overlay whatever is staged — new files are added, modified files
+    // are updated.  This ensures previously tracked files are never
+    // silently dropped just because they weren't re-staged.
+    vector<IndexEntry> mergedIndex;
 
     string parentHash = getCurrentCommit();
-    string author     = getAuthorString();
+    if (!parentHash.empty()) {
+        // get tree hash from parent commit
+        auto commitData = readObject(parentHash);
+        if (!commitData.empty()) {
+            size_t np = 0;
+            while (np < commitData.size() && commitData[np] != '\0') np++;
+            string content(commitData.begin() + np + 1, commitData.end());
+            stringstream ss(content);
+            string line;
+            while (getline(ss, line)) {
+                if (line.rfind("tree ", 0) == 0) {
+                    flattenTree(line.substr(5), "", mergedIndex);
+                    break;
+                }
+            }
+        }
+    }
+
+    // overlay staged entries (add new or update existing)
+    for (const auto& staged : stagedIndex) {
+        bool found = false;
+        for (auto& existing : mergedIndex) {
+            if (existing.path == staged.path) {
+                existing.hash = staged.hash; // update
+                found = true;
+                break;
+            }
+        }
+        if (!found) mergedIndex.push_back(staged); // new file
+    }
+
+    // ── Build tree from merged full snapshot ─────────────────────────────
+    string treeHash = buildTreeFromIndex(mergedIndex);
+    if (treeHash.empty()) { cerr << "Error: failed to build tree.\n"; return; }
+
+    string author = getAuthorString();
 
     string body;
     body += "tree "      + treeHash  + "\n";

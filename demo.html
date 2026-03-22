@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MyGit — Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0D1117;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Courier New', Courier, monospace;
+    padding: 20px;
+  }
+
+  h1 {
+    color: #58A6FF;
+    font-size: 1.4rem;
+    margin-bottom: 6px;
+    letter-spacing: 0.05em;
+  }
+
+  p.subtitle {
+    color: #8B949E;
+    font-size: 0.82rem;
+    margin-bottom: 20px;
+    letter-spacing: 0.03em;
+  }
+
+  /* ── Terminal window ── */
+  .terminal {
+    width: 720px;
+    max-width: 100%;
+    background: #161B22;
+    border-radius: 10px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.7);
+    overflow: hidden;
+    border: 1px solid #30363D;
+  }
+
+  .titlebar {
+    background: #21262D;
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border-bottom: 1px solid #30363D;
+  }
+
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot.red    { background: #FF5F57; }
+  .dot.yellow { background: #FEBC2E; }
+  .dot.green  { background: #28C840; }
+
+  .titlebar span {
+    color: #8B949E;
+    font-size: 0.78rem;
+    margin-left: auto;
+    margin-right: auto;
+    transform: translateX(-20px);
+  }
+
+  .screen {
+    padding: 16px 18px;
+    min-height: 380px;
+    font-size: 0.82rem;
+    line-height: 1.65;
+    overflow-y: auto;
+    max-height: 520px;
+  }
+
+  /* ── Text colours ── */
+  .prompt   { color: #3FB950; }   /* green $  */
+  .cmd      { color: #E6EDF3; }   /* command text */
+  .flag     { color: #79C0FF; }   /* -m "message"  */
+  .output   { color: #8B949E; }   /* normal output */
+  .hash     { color: #F6E05E; }   /* commit hashes */
+  .branch   { color: #D2A8FF; }   /* branch names  */
+  .success  { color: #3FB950; }   /* green success */
+  .error    { color: #F85149; }   /* red error     */
+  .info     { color: #58A6FF; }   /* blue info     */
+  .staged   { color: #79C0FF; }   /* staged files  */
+  .modified { color: #F0883E; }   /* modified      */
+  .cursor   { 
+    display: inline-block; 
+    width: 8px; height: 14px; 
+    background: #3FB950; 
+    vertical-align: middle;
+    animation: blink 1s step-end infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .line { display: block; white-space: pre-wrap; word-break: break-all; }
+
+  /* ── Controls ── */
+  .controls {
+    margin-top: 16px;
+    display: flex;
+    gap: 10px;
+  }
+
+  button {
+    background: #21262D;
+    color: #E6EDF3;
+    border: 1px solid #30363D;
+    padding: 7px 18px;
+    border-radius: 6px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  button:hover { background: #30363D; border-color: #58A6FF; }
+  button.active { border-color: #3FB950; color: #3FB950; }
+
+  .speed-label { color: #8B949E; font-size: 0.78rem; align-self: center; }
+</style>
+</head>
+<body>
+
+<h1>MyGit — Version Control System</h1>
+<p class="subtitle">C++ implementation of Git's internal object model &nbsp;·&nbsp; SHA-1 · zlib · content-addressable storage</p>
+
+<div class="terminal">
+  <div class="titlebar">
+    <div class="dot red"></div>
+    <div class="dot yellow"></div>
+    <div class="dot green"></div>
+    <span>vaibhav@dev: ~/projects/myproject</span>
+  </div>
+  <div class="screen" id="screen"></div>
+</div>
+
+<div class="controls">
+  <button id="btn-restart">↺ Restart</button>
+  <button id="btn-pause">⏸ Pause</button>
+  <span class="speed-label">Speed:</span>
+  <button id="btn-slow">1×</button>
+  <button id="btn-fast" class="active">2×</button>
+</div>
+
+<script>
+// ── Script definition ──────────────────────────────────────────────────────
+// Each entry is either:
+//   { type: "cmd",    text: "...",   flags: [[start,end,"flag"]] }
+//   { type: "out",    lines: [ {text, cls} ] }
+//   { type: "blank" }
+//   { type: "comment", text: "# ..." }
+
+const SCRIPT = [
+  // ── Init ──
+  { type: "comment", text: "# Initialise a new repository" },
+  { type: "cmd",  text: "./mygit init" },
+  { type: "out",  lines: [
+    { text: "Initialized empty MyGit repository in .git/", cls: "success" }
+  ]},
+  { type: "blank" },
+
+  // ── Create files ──
+  { type: "comment", text: "# Create some project files" },
+  { type: "cmd",  text: 'echo "#include <iostream>" > src/main.cpp' },
+  { type: "cmd",  text: 'echo "void helper() {}" > src/helper.cpp' },
+  { type: "cmd",  text: 'echo "# My Project" > README.md' },
+  { type: "blank" },
+
+  // ── Add + commit ──
+  { type: "comment", text: "# Stage all files and make initial commit" },
+  { type: "cmd",  text: "./mygit add ." },
+  { type: "out",  lines: [
+    { text: "Changes staged.", cls: "success" }
+  ]},
+  { type: "cmd",  text: './mygit commit -m "initial commit"',
+    flags: [[16, 32, "flag"]] },
+  { type: "out",  lines: [
+    { text: "[e268b40] initial commit", cls: "hash" }
+  ]},
+  { type: "blank" },
+
+  // ── Modify + second commit ──
+  { type: "comment", text: "# Modify a file and commit the change" },
+  { type: "cmd",  text: 'echo "int main() {}" >> src/main.cpp' },
+  { type: "cmd",  text: "./mygit add src/main.cpp" },
+  { type: "out",  lines: [{ text: "Changes staged.", cls: "success" }]},
+  { type: "cmd",  text: './mygit commit -m "add main function"',
+    flags: [[16, 34, "flag"]] },
+  { type: "out",  lines: [
+    { text: "[6e0c307] add main function", cls: "hash" }
+  ]},
+  { type: "blank" },
+
+  // ── Log ──
+  { type: "comment", text: "# View commit history — parent pointer chain" },
+  { type: "cmd",  text: "./mygit log" },
+  { type: "out",  lines: [
+    { text: "commit 6e0c307265852eab8c90391d63a5fc2f643648f1", cls: "hash" },
+    { text: "Parent: e268b4019a7dfda7362b1b771054ab0a442f91dd", cls: "output" },
+    { text: "Author: Vaibhav Gupta <vaibhav@example.com>",    cls: "output" },
+    { text: "Date:   2026-03-22 15:18:47",                   cls: "output" },
+    { text: "",                                               cls: "output" },
+    { text: "    add main function",                          cls: "output" },
+    { text: "",                                               cls: "output" },
+    { text: "commit e268b4019a7dfda7362b1b771054ab0a442f91dd", cls: "hash" },
+    { text: "Author: Vaibhav Gupta <vaibhav@example.com>",    cls: "output" },
+    { text: "Date:   2026-03-22 15:18:45",                   cls: "output" },
+    { text: "",                                               cls: "output" },
+    { text: "    initial commit",                             cls: "output" },
+  ]},
+  { type: "blank" },
+
+  // ── Branch ──
+  { type: "comment", text: "# Create and switch to a feature branch" },
+  { type: "cmd",  text: "./mygit branch feature-x" },
+  { type: "out",  lines: [
+    { text: "Created branch 'feature-x' at 6e0c307", cls: "branch" }
+  ]},
+  { type: "cmd",  text: "./mygit branch" },
+  { type: "out",  lines: [
+    { text: "  feature-x", cls: "branch" },
+    { text: "* main",      cls: "success" },
+  ]},
+  { type: "cmd",  text: "./mygit switch feature-x" },
+  { type: "out",  lines: [
+    { text: "Switched to branch 'feature-x'", cls: "success" }
+  ]},
+  { type: "blank" },
+
+  // ── Commit on branch ──
+  { type: "comment", text: "# Commit new feature on the branch" },
+  { type: "cmd",  text: 'echo "feature work" > feature.txt' },
+  { type: "cmd",  text: "./mygit add feature.txt" },
+  { type: "out",  lines: [{ text: "Changes staged.", cls: "success" }]},
+  { type: "cmd",  text: './mygit commit -m "add feature on feature-x"',
+    flags: [[16, 44, "flag"]] },
+  { type: "out",  lines: [
+    { text: "[f08b327] add feature on feature-x", cls: "hash" }
+  ]},
+  { type: "blank" },
+
+  // ── Switch back ──
+  { type: "comment", text: "# Switch back — working directory restores" },
+  { type: "cmd",  text: "./mygit switch main" },
+  { type: "out",  lines: [
+    { text: "Switched to branch 'main'", cls: "success" }
+  ]},
+  { type: "blank" },
+
+  // ── Status ──
+  { type: "comment", text: "# Check what's changed" },
+  { type: "cmd",  text: "./mygit status" },
+  { type: "out",  lines: [
+    { text: "Nothing staged for commit.",  cls: "output" },
+    { text: "",                            cls: "output" },
+    { text: "Unstaged changes:",           cls: "output" },
+    { text: "  untracked: feature.txt",    cls: "modified" },
+  ]},
+  { type: "blank" },
+
+  // ── Checkout historical commit ──
+  { type: "comment", text: "# Restore any historical commit" },
+  { type: "cmd",  text: "./mygit checkout e268b40" },
+  { type: "out",  lines: [
+    { text: "HEAD is now at e268b40", cls: "info" }
+  ]},
+  { type: "blank" },
+
+  // ── Inspect objects ──
+  { type: "comment", text: "# Inspect the object store directly" },
+  { type: "cmd",  text: "./mygit write-tree" },
+  { type: "out",  lines: [
+    { text: "a1d41ee59efd7b2bce3e84e8288cbc17f5b46ba2", cls: "hash" }
+  ]},
+  { type: "cmd",  text: "./mygit ls-tree --name-only a1d41ee" },
+  { type: "out",  lines: [
+    { text: "README.md", cls: "output" },
+    { text: "src",       cls: "output" },
+  ]},
+  { type: "cmd",  text: "./mygit hash-object -w README.md" },
+  { type: "out",  lines: [
+    { text: "d1690510776ebc84930fae4f4e48a2d6037fefb8", cls: "hash" }
+  ]},
+  { type: "cmd",  text: "./mygit cat-file -p d1690510" },
+  { type: "out",  lines: [
+    { text: "# My Project", cls: "output" }
+  ]},
+  { type: "blank" },
+
+  // ── Done ──
+  { type: "comment", text: "# Objects stored in .git — SHA-1 addressed, zlib compressed" },
+  { type: "cmd",  text: "ls .git/objects/ | head -6" },
+  { type: "out",  lines: [
+    { text: "1f/  3b/  6e/  a1/  d1/  e2/", cls: "output" },
+  ]},
+];
+
+// ── Renderer ──────────────────────────────────────────────────────────────────
+
+const screen  = document.getElementById("screen");
+const CHAR_MS  = { slow: 55, fast: 22 };
+const OUT_MS   = { slow: 60, fast: 28 };
+const PAUSE_MS = { slow: 700, fast: 380 };
+
+let speed = "fast";
+let paused = false;
+let currentTimeout = null;
+let stepIndex = 0;
+let charIndex  = 0;
+let lineIndex  = 0;
+let phase = "idle"; // "typing" | "output" | "next"
+let currentCmdEl = null;
+let currentCursorEl = null;
+
+function sleep(ms) {
+  return new Promise(r => {
+    currentTimeout = setTimeout(r, ms);
+  });
+}
+
+function addLine(text, cls) {
+  const el = document.createElement("span");
+  el.className = `line ${cls || ""}`;
+  el.textContent = text;
+  screen.appendChild(el);
+  screen.scrollTop = screen.scrollHeight;
+  return el;
+}
+
+function setHTML(el, html) { el.innerHTML = html; }
+
+// Build prompt line (returns the text span and cursor)
+function addPromptLine() {
+  const el = document.createElement("span");
+  el.className = "line";
+  screen.appendChild(el);
+
+  const promptSpan = document.createElement("span");
+  promptSpan.className = "prompt";
+  promptSpan.textContent = "$ ";
+  el.appendChild(promptSpan);
+
+  const textSpan = document.createElement("span");
+  textSpan.className = "cmd";
+  el.appendChild(textSpan);
+
+  const cursor = document.createElement("span");
+  cursor.className = "cursor";
+  el.appendChild(cursor);
+
+  screen.scrollTop = screen.scrollHeight;
+  return { el, textSpan, cursor };
+}
+
+// colour a command string with flag ranges
+function buildCmdHTML(text, flags) {
+  if (!flags || flags.length === 0) return escapeHTML(text);
+  let html = "";
+  let pos = 0;
+  for (const [start, end, cls] of flags) {
+    html += escapeHTML(text.slice(pos, start));
+    html += `<span class="${cls}">${escapeHTML(text.slice(start, end))}</span>`;
+    pos = end;
+  }
+  html += escapeHTML(text.slice(pos));
+  return html;
+}
+
+function escapeHTML(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+async function runScript() {
+  stepIndex = 0;
+  charIndex = 0;
+  lineIndex = 0;
+
+  while (stepIndex < SCRIPT.length) {
+    if (paused) { await new Promise(r => { /* wait for resume */ window._resumeFn = r; }); }
+
+    const step = SCRIPT[stepIndex];
+
+    if (step.type === "blank") {
+      addLine("", "");
+      stepIndex++;
+      continue;
+    }
+
+    if (step.type === "comment") {
+      addLine(step.text, "output");
+      await sleep(PAUSE_MS[speed] * 0.4);
+      stepIndex++;
+      continue;
+    }
+
+    if (step.type === "cmd") {
+      // Type out the command character by character
+      const { textSpan, cursor } = addPromptLine();
+      const text = step.text;
+
+      for (let i = 0; i <= text.length; i++) {
+        if (paused) { await new Promise(r => { window._resumeFn = r; }); }
+        textSpan.innerHTML = buildCmdHTML(text.slice(0, i), step.flags);
+        screen.scrollTop = screen.scrollHeight;
+        if (i < text.length) await sleep(CHAR_MS[speed]);
+      }
+
+      // blink cursor briefly then remove it and "press enter"
+      await sleep(PAUSE_MS[speed]);
+      cursor.remove();
+      stepIndex++;
+      continue;
+    }
+
+    if (step.type === "out") {
+      for (const l of step.lines) {
+        if (paused) { await new Promise(r => { window._resumeFn = r; }); }
+        addLine(l.text, l.cls);
+        await sleep(OUT_MS[speed]);
+      }
+      await sleep(PAUSE_MS[speed] * 0.6);
+      stepIndex++;
+      continue;
+    }
+
+    stepIndex++;
+  }
+
+  // blinking cursor at end
+  const { cursor } = addPromptLine();
+}
+
+// ── Controls ────────────────────────────────────────────────────────────────
+
+document.getElementById("btn-restart").addEventListener("click", () => {
+  clearTimeout(currentTimeout);
+  paused = false;
+  screen.innerHTML = "";
+  document.getElementById("btn-pause").textContent = "⏸ Pause";
+  runScript();
+});
+
+document.getElementById("btn-pause").addEventListener("click", () => {
+  paused = !paused;
+  document.getElementById("btn-pause").textContent = paused ? "▶ Resume" : "⏸ Pause";
+  if (!paused && window._resumeFn) { window._resumeFn(); window._resumeFn = null; }
+});
+
+document.getElementById("btn-slow").addEventListener("click", () => {
+  speed = "slow";
+  document.getElementById("btn-slow").classList.add("active");
+  document.getElementById("btn-fast").classList.remove("active");
+});
+
+document.getElementById("btn-fast").addEventListener("click", () => {
+  speed = "fast";
+  document.getElementById("btn-fast").classList.add("active");
+  document.getElementById("btn-slow").classList.remove("active");
+});
+
+// ── Start ────────────────────────────────────────────────────────────────────
+runScript();
+</script>
+</body>
+</html>

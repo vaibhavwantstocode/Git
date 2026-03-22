@@ -22,6 +22,8 @@ zlib-compressed binary files in `.git/objects/`, exactly as real Git does it.
 | `ls-tree` | Inspect a tree object |
 | `cat-file` | Print type, size, or content of any stored object |
 | `hash-object` | Compute (and optionally store) the SHA-1 of a file |
+|[MyGit Demo](assets/demo.gif)
+|[Object Graph](assets/git_objects.png)
 
 ---
 
