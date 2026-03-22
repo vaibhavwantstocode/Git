@@ -1,905 +1,892 @@
 #include <iostream>
 #include <filesystem>
-#include <dirent.h>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <zlib.h>
 #include <algorithm>
 #include <openssl/sha.h>
-#include <fcntl.h>
 #include <ctime>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
+#include <map>
+#include <set>
 
 using namespace std;
 
-string callCreatingBlobObject(const string &fileName, const string &flag);
-string writeTree(const string &directoryPath);
-void lsTree(const string &treeHash, const string &flag);
-void mygitAdd(const vector<string> &files);
-void mygitCommit(const string &message);
+// ─────────────────────────────────────────────
+// FIX 1: Safe decompression — doubles buffer
+//         until uncompress succeeds, no magic *100
+// ─────────────────────────────────────────────
+vector<unsigned char> safeDecompress(const vector<unsigned char>& compressed) {
+    uLongf destLen = compressed.size() * 4;
+    vector<unsigned char> dest(destLen);
 
-string callCreatingBlobObject(const string &fileName, const string &flag)
-{
-    ifstream file(fileName, ios::binary); // Binary mode
-    if (!file.is_open())
-    {
-        cerr << "Error: No such file or directory exists.\n";
-        return "";
+    while (true) {
+        int result = uncompress(dest.data(), &destLen,
+                                compressed.data(), compressed.size());
+        if (result == Z_OK) {
+            dest.resize(destLen);
+            return dest;
+        } else if (result == Z_BUF_ERROR) {
+            destLen *= 2;
+            dest.resize(destLen);
+        } else {
+            cerr << "Error: decompression failed (code " << result << ")\n";
+            return {};
+        }
     }
+}
 
-    
-    stringstream buffer;
-    buffer << file.rdbuf();
-    string content = buffer.str();
-    unsigned long long size = content.size();
+// ─────────────────────────────────────────────
+// FIX 2: Author from ~/.gitconfig or env vars
+//         No more hardcoded VaibhavGupta@gmail.com
+// ─────────────────────────────────────────────
+string getAuthorString() {
+    // Try environment variables first (same as real Git)
+    const char* name = getenv("GIT_AUTHOR_NAME");
+    const char* email = getenv("GIT_AUTHOR_EMAIL");
 
-    
-    string blob_obj = "blob " + to_string(size) + '\0' + content;
+    string authorName  = name  ? name  : "";
+    string authorEmail = email ? email : "";
 
-    
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<const unsigned char *>(blob_obj.c_str()), blob_obj.size(), hash);
-
-    
-    stringstream ss;
-    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
-    {
-        ss << hex << setw(2) << setfill('0') << static_cast<unsigned int>(hash[i]);
-    }
-    string hashStr = ss.str();
-
-    // If the -w flag is present, write the object to the .git/objects directory
-    if (flag == "-w")
-    {
-        string folder = hashStr.substr(0, 2);
-        string fileNamePart = hashStr.substr(2);
-        string folderPath = ".git/objects/" + folder;
-
-        if (!filesystem::exists(folderPath))
-        {
-            if (!filesystem::create_directory(folderPath))
-            {
-                cerr << "Error: Failed to create directory " << folderPath << "\n";
-                return "";
+    // Fall back to ~/.gitconfig
+    if (authorName.empty() || authorEmail.empty()) {
+        string configPath = string(getenv("HOME") ? getenv("HOME") : ".") + "/.gitconfig";
+        ifstream config(configPath);
+        string line;
+        while (getline(config, line)) {
+            if (line.find("name") != string::npos && authorName.empty()) {
+                size_t eq = line.find('=');
+                if (eq != string::npos)
+                    authorName = line.substr(eq + 1);
+                while (!authorName.empty() && authorName[0] == ' ')
+                    authorName = authorName.substr(1);
+            }
+            if (line.find("email") != string::npos && authorEmail.empty()) {
+                size_t eq = line.find('=');
+                if (eq != string::npos)
+                    authorEmail = line.substr(eq + 1);
+                while (!authorEmail.empty() && authorEmail[0] == ' ')
+                    authorEmail = authorEmail.substr(1);
             }
         }
-
-        // Compress the blob object
-        uLongf compressedSize = compressBound(blob_obj.size());
-        vector<unsigned char> compressedBuffer(compressedSize);
-
-        int result = compress(compressedBuffer.data(), &compressedSize,
-                              reinterpret_cast<const Bytef *>(blob_obj.data()), blob_obj.size());
-        if (result != Z_OK)
-        {
-            cerr << "Error: Failed to compress data. Result code: " << result << "\n";
-            return "";
-        }
-
-        compressedBuffer.resize(compressedSize);
-
-        ofstream outFile(folderPath + "/" + fileNamePart, ios::binary);
-        if (!outFile.is_open())
-        {
-            cerr << "Error: Failed to create file.\n";
-            return "";
-        }
-
-        outFile.write(reinterpret_cast<const char *>(compressedBuffer.data()),
-                      static_cast<std::streamsize>(compressedSize));
-        outFile.close();
     }
-    // else
-    // {
-    //     // Print the hash to the console if flag is not "-w"
-    //     cout << hashStr << endl;
-    // }
 
-    // Return the hash string
-    return hashStr;
+    if (authorName.empty())  authorName  = "Unknown";
+    if (authorEmail.empty()) authorEmail = "unknown@example.com";
+
+    time_t now = time(nullptr);
+    char timeStr[64];
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S %z", localtime(&now));
+
+    return authorName + " <" + authorEmail + "> " + timeStr;
 }
 
-// Write tree function
-
-void hexStringToBinary(const string &hexStr, unsigned char *binaryHash)
-{
-    for (size_t i = 0; i < SHA_DIGEST_LENGTH; ++i)
-    {
-        string byteString = hexStr.substr(i * 2, 2);
-        binaryHash[i] = (unsigned char)strtol(byteString.c_str(), nullptr, 16);
-    }
-}
-
-string writeTree(const string &directoryPath)
-{
-    struct TreeEntry
-    {
-        string mode;
-        string filename;
-        unsigned char hash[SHA_DIGEST_LENGTH];
-    };
-
-    vector<TreeEntry> entries;
-
-    for (const auto &entry : filesystem::directory_iterator(directoryPath))
-    {
-        if (entry.path().filename() == ".git")
-            continue; // need to skip the .git directory
-
-        string filename = entry.path().filename().string();
-        string mode;
-        unsigned char hash[SHA_DIGEST_LENGTH];
-
-        if (entry.is_directory())
-        {
-            // Recursively for subdirectories
-            string subtreeHashHex = writeTree(entry.path().string());
-
-            
-            hexStringToBinary(subtreeHashHex, hash);
-
-            mode = "40000";
-        }
-        else if (entry.is_regular_file())
-        {
-            
-            string filePath = entry.path().string();
-            string blobHashHex = callCreatingBlobObject(filePath, "-w");
-
-            
-            hexStringToBinary(blobHashHex, hash);
-
-            mode = "100644";
-        }
-        else
-        {
-            continue; // need to skip other type
-        }
-
-        TreeEntry treeEntry = {mode, filename, {0}};
-        memcpy(treeEntry.hash, hash, SHA_DIGEST_LENGTH);
-        entries.push_back(treeEntry);
-    }
-
-
-    sort(entries.begin(), entries.end(), [](const TreeEntry &a, const TreeEntry &b)
-              { return a.filename < b.filename; });
-
-
-    vector<char> treeContent;
-    for (const auto &entry : entries)
-    {
-        string entryStr = entry.mode + ' ' + entry.filename;
-        treeContent.insert(treeContent.end(), entryStr.begin(), entryStr.end());
-        treeContent.push_back('\0'); // Null terminator
-
-        
-        treeContent.insert(treeContent.end(), entry.hash, entry.hash + SHA_DIGEST_LENGTH);
-    }
-
-    string header = "tree " + to_string(treeContent.size()) + '\0';
-    string treeObj = header + string(treeContent.begin(), treeContent.end());
-
-    // Computing SHA-1
-    unsigned char treeHash[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<const unsigned char *>(treeObj.c_str()), treeObj.size(), treeHash);
-
-
+// ─────────────────────────────────────────────
+// Helpers: SHA-1 hex and binary conversion
+// ─────────────────────────────────────────────
+string bytesToHex(const unsigned char* hash, int len = SHA_DIGEST_LENGTH) {
     stringstream ss;
-    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
-    {
-        ss << hex << setw(2) << setfill('0') << static_cast<unsigned int>(treeHash[i]);
-    }
-    string treeHashHex = ss.str();
-
-    // Now we need to write the tree object to the .git/objects directory
-    string folder = treeHashHex.substr(0, 2);
-    string fileNamePart = treeHashHex.substr(2);
-    string folderPath = ".git/objects/" + folder;
-
-    if (!filesystem::exists(folderPath))
-    {
-        filesystem::create_directory(folderPath);
-    }
-
-    uLongf compressedSize = compressBound(treeObj.size());
-    vector<unsigned char> compressedBuffer(compressedSize);
-
-    int result = compress(compressedBuffer.data(), &compressedSize,
-                          reinterpret_cast<const Bytef *>(treeObj.data()), treeObj.size());
-    if (result != Z_OK)
-    {
-        cerr << "Error: Failed to compress tree object. Result code: " << result << "\n";
-        return "";
-    }
-
-    compressedBuffer.resize(compressedSize);
-
-    ofstream outFile(folderPath + "/" + fileNamePart, ios::binary);
-    if (!outFile.is_open())
-    {
-        cerr << "Error: Failed to write tree object.\n";
-        return "";
-    }
-
-    outFile.write(reinterpret_cast<const char *>(compressedBuffer.data()),
-                  static_cast<std::streamsize>(compressedSize));
-    outFile.close();
-
-    return treeHashHex;
+    for (int i = 0; i < len; ++i)
+        ss << hex << setw(2) << setfill('0') << (unsigned int)hash[i];
+    return ss.str();
 }
 
-// ls-tree function
-
-void lsTree(const string &treeHash, const string &flag)
-{
-    string folderName = treeHash.substr(0, 2);
-    string fileName = treeHash.substr(2);
-    string completeFilePath = ".git/objects/" + folderName + "/" + fileName;
-
-    if (!filesystem::exists(completeFilePath))
-    {
-        cerr << "Not a valid object name " << treeHash << "\n";
-        return;
+void hexToBytes(const string& hex, unsigned char* out) {
+    for (size_t i = 0; i < SHA_DIGEST_LENGTH; ++i) {
+        string byte = hex.substr(i * 2, 2);
+        out[i] = (unsigned char)strtol(byte.c_str(), nullptr, 16);
     }
+}
 
-    ifstream file(completeFilePath, ios::binary);
-    if (!file.is_open())
-    {
-        cerr << "Error: Failed to open tree object file.\n";
-        return;
+// Write raw bytes to .git/objects/<xx>/<38 chars>
+// Returns hash hex string
+string writeObject(const string& objectData) {
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    SHA1(reinterpret_cast<const unsigned char*>(objectData.c_str()),
+         objectData.size(), hash);
+    string hashHex = bytesToHex(hash);
+
+    string folder   = ".git/objects/" + hashHex.substr(0, 2);
+    string filePath = folder + "/" + hashHex.substr(2);
+
+    if (filesystem::exists(filePath))
+        return hashHex; // already stored — content-addressable dedup
+
+    filesystem::create_directories(folder);
+
+    uLongf compLen = compressBound(objectData.size());
+    vector<unsigned char> comp(compLen);
+    if (compress(comp.data(), &compLen,
+                 reinterpret_cast<const Bytef*>(objectData.data()),
+                 objectData.size()) != Z_OK) {
+        cerr << "Error: compression failed\n";
+        return "";
     }
+    comp.resize(compLen);
 
-    vector<unsigned char> compressedData((istreambuf_iterator<char>(file)),
-                                         istreambuf_iterator<char>());
-    file.close();
+    ofstream out(filePath, ios::binary);
+    out.write(reinterpret_cast<const char*>(comp.data()), compLen);
+    return hashHex;
+}
 
-    uLongf decompressedSize = compressedData.size() * 100; // Estimating decompressed size
-    vector<unsigned char> decompressedBuffer(decompressedSize);
-
-    int result = uncompress(decompressedBuffer.data(), &decompressedSize,
-                            compressedData.data(), compressedData.size());
-    if (result != Z_OK)
-    {
-        cerr << "Error: Failed to decompress tree object. Result code: " << result << "\n";
-        return;
+// Read and decompress a .git/objects file, return raw bytes
+vector<unsigned char> readObject(const string& hashHex) {
+    string path = ".git/objects/" + hashHex.substr(0, 2) + "/" + hashHex.substr(2);
+    if (!filesystem::exists(path)) {
+        cerr << "Error: object not found: " << hashHex << "\n";
+        return {};
     }
+    ifstream f(path, ios::binary);
+    vector<unsigned char> comp((istreambuf_iterator<char>(f)), {});
+    return safeDecompress(comp);
+}
 
-    decompressedBuffer.resize(decompressedSize);
+// ─────────────────────────────────────────────
+// Blob
+// ─────────────────────────────────────────────
+string createBlob(const string& filePath, bool write) {
+    ifstream f(filePath, ios::binary);
+    if (!f) { cerr << "Error: cannot open " << filePath << "\n"; return ""; }
 
-    size_t index = 0;
+    string content((istreambuf_iterator<char>(f)), {});
+    string obj = "blob " + to_string(content.size()) + '\0' + content;
 
-    // need to skip the header
-    while (index < decompressedBuffer.size() && decompressedBuffer[index] != '\0')
-    {
-        index++;
-    }
-    index++; 
-
-    while (index < decompressedBuffer.size())
-    {
-        
-        string mode;
-        while (index < decompressedBuffer.size() && decompressedBuffer[index] != ' ')
-        {
-            mode += decompressedBuffer[index];
-            index++;
-        }
-        index++; // need to skip the space
-
-        string filename;
-        while (index < decompressedBuffer.size() && decompressedBuffer[index] != '\0')
-        {
-            filename += decompressedBuffer[index];
-            index++;
-        }
-        index++; // need to skip the null byte
-
-
+    if (!write) {
+        // just compute hash, don't write
         unsigned char hash[SHA_DIGEST_LENGTH];
-        if (index + SHA_DIGEST_LENGTH > decompressedBuffer.size())
-        {
-            cerr << "Error: Unexpected end of data while reading hash.\n";
-            return;
-        }
-        memcpy(hash, &decompressedBuffer[index], SHA_DIGEST_LENGTH);
-        index += SHA_DIGEST_LENGTH;
+        SHA1(reinterpret_cast<const unsigned char*>(obj.c_str()), obj.size(), hash);
+        return bytesToHex(hash);
+    }
+    return writeObject(obj);
+}
 
-        stringstream ss;
-        for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
-        {
-            ss << hex << setw(2) << setfill('0') << static_cast<unsigned int>(hash[i]);
+// ─────────────────────────────────────────────
+// Tree (recursive)
+// ─────────────────────────────────────────────
+string writeTree(const string& dirPath) {
+    struct Entry { string mode, name; unsigned char hash[SHA_DIGEST_LENGTH]; };
+    vector<Entry> entries;
+
+    for (const auto& e : filesystem::directory_iterator(dirPath)) {
+        if (e.path().filename() == ".git") continue;
+
+        Entry ent;
+        ent.name = e.path().filename().string();
+        memset(ent.hash, 0, SHA_DIGEST_LENGTH);
+
+        if (e.is_directory()) {
+            string sub = writeTree(e.path().string());
+            if (sub.empty()) continue;
+            hexToBytes(sub, ent.hash);
+            ent.mode = "40000";
+        } else if (e.is_regular_file()) {
+            string blobHash = createBlob(e.path().string(), true);
+            if (blobHash.empty()) continue;
+            hexToBytes(blobHash, ent.hash);
+            ent.mode = "100644";
+        } else continue;
+
+        entries.push_back(ent);
+    }
+
+    sort(entries.begin(), entries.end(),
+         [](const Entry& a, const Entry& b){ return a.name < b.name; });
+
+    vector<char> body;
+    for (const auto& e : entries) {
+        string hdr = e.mode + ' ' + e.name;
+        body.insert(body.end(), hdr.begin(), hdr.end());
+        body.push_back('\0');
+        body.insert(body.end(), e.hash, e.hash + SHA_DIGEST_LENGTH);
+    }
+
+    string obj = "tree " + to_string(body.size()) + '\0'
+               + string(body.begin(), body.end());
+    return writeObject(obj);
+}
+
+// ─────────────────────────────────────────────
+// ls-tree
+// ─────────────────────────────────────────────
+void lsTree(const string& treeHash, const string& flag) {
+    auto data = readObject(treeHash);
+    if (data.empty()) return;
+
+    // skip header (everything up to and including first \0)
+    size_t idx = 0;
+    while (idx < data.size() && data[idx] != '\0') idx++;
+    idx++;
+
+    while (idx < data.size()) {
+        string mode;
+        while (idx < data.size() && data[idx] != ' ')
+            mode += (char)data[idx++];
+        idx++; // skip space
+
+        string name;
+        while (idx < data.size() && data[idx] != '\0')
+            name += (char)data[idx++];
+        idx++; // skip null
+
+        if (idx + SHA_DIGEST_LENGTH > data.size()) {
+            cerr << "Error: unexpected end of tree data\n"; return;
         }
-        string hashHex = ss.str();
+        string hashHex = bytesToHex(&data[idx]);
+        idx += SHA_DIGEST_LENGTH;
 
         string type = (mode == "40000") ? "tree" : "blob";
 
         if (flag == "--name-only")
-        {
-            cout << filename << endl;
-        }
+            cout << name << "\n";
         else
-        {
-            cout << mode << " " << type << " " << hashHex << " " << filename << endl;
-        }
+            cout << mode << " " << type << " " << hashHex << "\t" << name << "\n";
     }
 }
 
-// Log function
-void mygitLog()
-{
-    // We need to read the HEAD file to get the current branch reference
-    ifstream headFile(".git/HEAD");
-    if (!headFile.is_open())
-    {
-        cerr << "Error: Failed to read HEAD.\n";
+// ─────────────────────────────────────────────
+// cat-file
+// ─────────────────────────────────────────────
+void catFile(const string& flag, const string& hashHex) {
+    auto data = readObject(hashHex);
+    if (data.empty()) return;
+
+    // header ends at first \0
+    size_t nullPos = 0;
+    while (nullPos < data.size() && data[nullPos] != '\0') nullPos++;
+
+    string header(data.begin(), data.begin() + nullPos);
+    // header = "<type> <size>"
+    size_t spacePos = header.find(' ');
+    string type = header.substr(0, spacePos);
+    string sizeStr = header.substr(spacePos + 1);
+
+    if (flag == "-t") {
+        cout << type << "\n";
+    } else if (flag == "-s") {
+        cout << sizeStr << "\n";
+    } else if (flag == "-p") {
+        // print content after header null
+        for (size_t i = nullPos + 1; i < data.size(); ++i)
+            cout << (char)data[i];
+        cout << "\n";
+    } else {
+        cerr << "Unknown flag: " << flag << "\n";
+    }
+}
+
+// ─────────────────────────────────────────────
+// FIX 3: Index — proper read/write
+//         Format per line: "<hash> <filepath>"
+//         mygitAdd writes it; mygitCommit reads it
+// ─────────────────────────────────────────────
+struct IndexEntry { string hash, path; };
+
+vector<IndexEntry> readIndex() {
+    vector<IndexEntry> entries;
+    ifstream f(".git/index");
+    string line;
+    while (getline(f, line)) {
+        if (line.size() < 42) continue;
+        entries.push_back({ line.substr(0, 40), line.substr(41) });
+    }
+    return entries;
+}
+
+void writeIndex(const vector<IndexEntry>& entries) {
+    ofstream f(".git/index", ios::trunc);
+    for (const auto& e : entries)
+        f << e.hash << " " << e.path << "\n";
+}
+
+// Adds or updates one file in the index (by path)
+void stageFile(vector<IndexEntry>& index, const string& filePath) {
+    string hash = createBlob(filePath, true);
+    if (hash.empty()) return;
+
+    // normalise path  (strip leading ./)
+    string normPath = filePath;
+    if (normPath.size() >= 2 && normPath[0] == '.' && normPath[1] == '/')
+        normPath = normPath.substr(2);
+
+    // update if already staged, else append
+    for (auto& e : index) {
+        if (e.path == normPath) { e.hash = hash; return; }
+    }
+    index.push_back({ hash, normPath });
+}
+
+void mygitAdd(const vector<string>& files) {
+    auto index = readIndex();
+
+    for (const string& file : files) {
+        if (file == ".") {
+            for (const auto& e : filesystem::recursive_directory_iterator(".")) {
+                if (!e.is_regular_file()) continue;
+                string p = e.path().string();
+                if (p.find(".git") != string::npos) continue;
+                stageFile(index, p);
+            }
+        } else if (filesystem::is_directory(file)) {
+            for (const auto& e : filesystem::recursive_directory_iterator(file)) {
+                if (!e.is_regular_file()) continue;
+                string p = e.path().string();
+                if (p.find(".git") != string::npos) continue;
+                stageFile(index, p);
+            }
+        } else if (filesystem::is_regular_file(file)) {
+            stageFile(index, file);
+        } else {
+            cerr << "Error: '" << file << "' is not a valid file or directory\n";
+        }
+    }
+
+    writeIndex(index);
+    cout << "Changes staged.\n";
+}
+
+// ─────────────────────────────────────────────
+// HEAD helpers
+// ─────────────────────────────────────────────
+// Returns the current commit hash (empty string if none yet)
+string getCurrentCommit() {
+    ifstream head(".git/HEAD");
+    string ref; getline(head, ref);
+
+    if (ref.substr(0, 5) == "ref: ") {
+        string refPath = ".git/" + ref.substr(5);
+        ifstream rf(refPath);
+        if (!rf.is_open()) return ""; // branch exists but no commits yet
+        string hash; getline(rf, hash);
+        return hash;
+    }
+    // detached HEAD — ref IS the hash
+    return ref;
+}
+
+// Returns the ref path that HEAD points to (e.g. "refs/heads/main")
+// or empty string if detached
+string getHeadRef() {
+    ifstream head(".git/HEAD");
+    string ref; getline(head, ref);
+    if (ref.substr(0, 5) == "ref: ")
+        return ref.substr(5);
+    return "";
+}
+
+void updateRef(const string& refPath, const string& hash) {
+    string fullPath = ".git/" + refPath;
+    filesystem::create_directories(filesystem::path(fullPath).parent_path());
+    ofstream f(fullPath, ios::trunc);
+    f << hash << "\n";
+}
+
+// ─────────────────────────────────────────────
+// Commit — NOW reads the index to build tree
+// ─────────────────────────────────────────────
+// Builds a tree object from only the staged files (index entries).
+// Returns the tree hash.
+string buildTreeFromIndex(const vector<IndexEntry>& index) {
+    // Group files by their immediate directory
+    // We build a nested structure then write bottom-up.
+
+    // For simplicity: re-use writeTree(".") only for root-level files,
+    // but correctly filter to ONLY staged paths.
+    //
+    // Full implementation: build an in-memory tree, write recursively.
+
+    struct InMemoryTree {
+        map<string, string>        blobs;  // name → hash
+        map<string, InMemoryTree*> subtrees;
+
+        ~InMemoryTree() {
+            for (auto& p : subtrees) delete p.second;
+        }
+
+        string write() {
+            struct Entry { string mode, name; unsigned char hash[SHA_DIGEST_LENGTH]; };
+            vector<Entry> entries;
+
+            for (auto& [name, hash] : blobs) {
+                Entry e; e.mode = "100644"; e.name = name;
+                hexToBytes(hash, e.hash);
+                entries.push_back(e);
+            }
+            for (auto& [name, sub] : subtrees) {
+                string subHash = sub->write();
+                if (subHash.empty()) continue;
+                Entry e; e.mode = "40000"; e.name = name;
+                hexToBytes(subHash, e.hash);
+                entries.push_back(e);
+            }
+
+            sort(entries.begin(), entries.end(),
+                 [](const Entry& a, const Entry& b){ return a.name < b.name; });
+
+            vector<char> body;
+            for (const auto& e : entries) {
+                string hdr = e.mode + ' ' + e.name;
+                body.insert(body.end(), hdr.begin(), hdr.end());
+                body.push_back('\0');
+                body.insert(body.end(), e.hash, e.hash + SHA_DIGEST_LENGTH);
+            }
+
+            string obj = "tree " + to_string(body.size()) + '\0'
+                       + string(body.begin(), body.end());
+            return writeObject(obj);
+        }
+    };
+
+    InMemoryTree root;
+
+    for (const auto& entry : index) {
+        // split path into components
+        vector<string> parts;
+        stringstream ss(entry.path);
+        string part;
+        while (getline(ss, part, '/'))
+            if (!part.empty()) parts.push_back(part);
+
+        // walk/create the tree structure
+        InMemoryTree* cur = &root;
+        for (size_t i = 0; i + 1 < parts.size(); ++i) {
+            if (!cur->subtrees.count(parts[i]))
+                cur->subtrees[parts[i]] = new InMemoryTree();
+            cur = cur->subtrees[parts[i]];
+        }
+        cur->blobs[parts.back()] = entry.hash;
+    }
+
+    return root.write();
+}
+
+void mygitCommit(const string& message) {
+    auto index = readIndex();
+    if (index.empty()) {
+        cerr << "Nothing to commit. Use 'mygit add <file>' first.\n";
         return;
     }
 
-    string refLine;
-    getline(headFile, refLine);
-    headFile.close();
+    // FIX: build tree from STAGED files, not entire working directory
+    string treeHash = buildTreeFromIndex(index);
+    if (treeHash.empty()) { cerr << "Error: failed to build tree.\n"; return; }
 
-    string refPath = refLine.substr(5); // Skipping "ref: "
-    string headRefPath = ".git/" + refPath;
+    string parentHash = getCurrentCommit();
+    string author     = getAuthorString();
 
-    ifstream refFile(headRefPath);
-    if (!refFile.is_open())
-    {
-        cerr << "Error: Failed to read current branch reference.\n";
-        return;
+    string body;
+    body += "tree "      + treeHash  + "\n";
+    if (!parentHash.empty())
+        body += "parent " + parentHash + "\n";
+    body += "author "    + author    + "\n";
+    body += "committer " + author    + "\n";
+    body += "\n" + message + "\n";
+
+    string obj = "commit " + to_string(body.size()) + '\0' + body;
+    string commitHash = writeObject(obj);
+
+    // Update branch ref
+    string headRef = getHeadRef();
+    if (!headRef.empty()) {
+        updateRef(headRef, commitHash);
+    } else {
+        // detached HEAD — update HEAD directly
+        ofstream hf(".git/HEAD", ios::trunc);
+        hf << commitHash << "\n";
     }
 
-    string commitHash;
-    getline(refFile, commitHash);
-    refFile.close();
+    // Clear the index — staged changes are now committed
+    writeIndex({});
 
-    // We need to traverse the commit objects
-    while (!commitHash.empty())
-    {
-        string folderName = commitHash.substr(0, 2);
-        string fileName = commitHash.substr(2);
-        string path = ".git/objects/" + folderName + "/" + fileName;
+    cout << "[" << commitHash.substr(0, 7) << "] " << message << "\n";
+}
 
-        if (!filesystem::exists(path))
-        {
-            cerr << "Error: Commit object not found " << commitHash << "\n";
-            return;
-        }
+// ─────────────────────────────────────────────
+// Log
+// ─────────────────────────────────────────────
+void mygitLog() {
+    string commitHash = getCurrentCommit();
+    if (commitHash.empty()) {
+        cout << "No commits yet.\n"; return;
+    }
 
-        ifstream file(path, ios::binary);
-        if (!file.is_open())
-        {
-            cerr << "Error: Failed to open commit object file.\n";
-            return;
-        }
+    while (!commitHash.empty()) {
+        auto data = readObject(commitHash);
+        if (data.empty()) return;
 
-        file.seekg(0, ios::end);
-        long long sizeOfFile = file.tellg();
-        file.seekg(0, ios::beg);
+        size_t nullPos = 0;
+        while (nullPos < data.size() && data[nullPos] != '\0') nullPos++;
+        string content(data.begin() + nullPos + 1, data.end());
 
-        vector<Bytef> buffer(sizeOfFile);
-        file.read(reinterpret_cast<char *>(buffer.data()), sizeOfFile);
-
-        if (file.fail())
-        {
-            cerr << "Error: Failed to read commit object file.\n";
-            return;
-        }
-        file.close();
-
-        uLongf decompressedSize = buffer.size() * 100;
-        vector<Bytef> decompressedBuffer(decompressedSize);
-
-        int result = uncompress(decompressedBuffer.data(), &decompressedSize, buffer.data(), buffer.size());
-        if (result != Z_OK)
-        {
-            cerr << "Error: Failed to decompress commit object. Result code: " << result << "\n";
-            return;
-        }
-
-        decompressedBuffer.resize(decompressedSize);
-
-        string commitContent(decompressedBuffer.begin(), decompressedBuffer.end());
-
-        // we need to skip the header
-        size_t nullPos = commitContent.find('\0');
-        if (nullPos == string::npos)
-        {
-            cerr << "Invalid commit object format.\n";
-            return;
-        }
-
-        string content = commitContent.substr(nullPos + 1);
-
-        // Parsing the commit content
         stringstream ss(content);
-        string line;
-        string treeHash, parentHash, author, committer, message;
-        bool messageStarted = false;
-
-        while (getline(ss, line))
-        {
-            if (line.rfind("tree ", 0) == 0)
-            {
-                treeHash = line.substr(5);
-            }
-            else if (line.rfind("parent ", 0) == 0)
-            {
-                parentHash = line.substr(7);
-            }
-            else if (line.rfind("author ", 0) == 0)
-            {
-                author = line.substr(7);
-            }
-            else if (line.rfind("committer ", 0) == 0)
-            {
-                committer = line.substr(10);
-            }
-            else if (line.empty())
-            {
-                // Start of the message
-                messageStarted = true;
-                continue;
-            }
-            else if (messageStarted)
-            {
+        string line, treeHash, parentHash, author, committer, message;
+        bool inMsg = false;
+        while (getline(ss, line)) {
+            if (!inMsg) {
+                if (line.rfind("tree ",   0) == 0) treeHash   = line.substr(5);
+                else if (line.rfind("parent ",    0) == 0) parentHash = line.substr(7);
+                else if (line.rfind("author ",    0) == 0) author     = line.substr(7);
+                else if (line.rfind("committer ", 0) == 0) committer  = line.substr(10);
+                else if (line.empty()) inMsg = true;
+            } else {
                 message += line + "\n";
             }
         }
 
-        cout << "commit " << commitHash << endl;
-        if (!parentHash.empty())
-        {
-            cout << "Parent: " << parentHash << endl;
-        }
-        cout << "Author: " << author << endl;
-        cout << "Date:   " << committer << endl;
-        cout << "\n    " << message << endl;
+        cout << "commit " << commitHash << "\n";
+        if (!parentHash.empty()) cout << "Parent: " << parentHash << "\n";
+        cout << "Author: " << author    << "\n";
+        cout << "Date:   " << committer << "\n";
+        cout << "\n    " << message << "\n";
 
-        // Now we need to move to parent commit
         commitHash = parentHash;
     }
 }
 
-void mygitAdd(const vector<string> &files)
-{
-    
-    ofstream indexFile(".git/index", ios::app);
-    if (!indexFile.is_open())
-    {
-        cerr << "Error: Could not open index file.\n";
-        return;
+// ─────────────────────────────────────────────
+// FIX 4: checkout — restores working directory
+//         from any commit hash
+// ─────────────────────────────────────────────
+
+// Forward declarations
+void restoreTree(const string& treeHash, const string& basePath);
+
+void restoreTree(const string& treeHash, const string& basePath) {
+    auto data = readObject(treeHash);
+    if (data.empty()) return;
+
+    // skip header
+    size_t idx = 0;
+    while (idx < data.size() && data[idx] != '\0') idx++;
+    idx++;
+
+    while (idx < data.size()) {
+        string mode;
+        while (idx < data.size() && data[idx] != ' ')
+            mode += (char)data[idx++];
+        idx++;
+
+        string name;
+        while (idx < data.size() && data[idx] != '\0')
+            name += (char)data[idx++];
+        idx++;
+
+        if (idx + SHA_DIGEST_LENGTH > data.size()) break;
+        string entryHash = bytesToHex(&data[idx]);
+        idx += SHA_DIGEST_LENGTH;
+
+        string fullPath = basePath + "/" + name;
+
+        if (mode == "40000") {
+            // directory
+            filesystem::create_directories(fullPath);
+            restoreTree(entryHash, fullPath);
+        } else {
+            // blob — decompress and write file
+            auto blob = readObject(entryHash);
+            if (blob.empty()) continue;
+
+            // skip blob header
+            size_t nul = 0;
+            while (nul < blob.size() && blob[nul] != '\0') nul++;
+            nul++;
+
+            filesystem::create_directories(
+                filesystem::path(fullPath).parent_path());
+
+            ofstream out(fullPath, ios::binary | ios::trunc);
+            out.write(reinterpret_cast<const char*>(&blob[nul]),
+                      blob.size() - nul);
+        }
     }
-
-    for (const string &file : files)
-    {
-        if (filesystem::is_directory(file))
-        {
-            // Recursively adding files
-            for (const auto &entry : filesystem::recursive_directory_iterator(file))
-            {
-                if (entry.is_regular_file())
-                {
-                    string filePath = entry.path().string();
-                    if (filePath.find(".git") != string::npos)
-                        continue; // Exclude files inside .git directory
-
-                    string hash = callCreatingBlobObject(filePath, "-w");
-                    indexFile << hash << " " << filePath << endl;
-                }
-            }
-        }
-        else if (filesystem::is_regular_file(file))
-        {
-            string hash = callCreatingBlobObject(file, "-w");
-            indexFile << hash << " " << file << endl;
-        }
-        else if (file == ".")
-        {
-            
-            for (const auto &entry : filesystem::recursive_directory_iterator("."))
-            {
-                if (entry.is_regular_file())
-                {
-                    string filePath = entry.path().string();
-                    if (filePath.find(".git") != string::npos)
-                        continue;
-
-                    string hash = callCreatingBlobObject(filePath, "-w");
-                    indexFile << hash << " " << filePath << endl;
-                }
-            }
-        }
-        else
-        {
-            cerr << "Error: " << file << " is not a valid file or directory.\n";
-        }
-    }
-
-    indexFile.close();
 }
 
-void mygitCommit(const string &message)
-{
+void mygitCheckout(const string& target) {
+    // target can be a commit hash OR a branch name
+    string commitHash;
 
-    ifstream indexFile(".git/index");
-    if (!indexFile.is_open())
-    {
-        cerr << "Error: No changes added to commit.\n";
+    // Check if target is a branch
+    string branchRef = "refs/heads/" + target;
+    string branchPath = ".git/" + branchRef;
+    if (filesystem::exists(branchPath)) {
+        ifstream f(branchPath);
+        getline(f, commitHash);
+        // Update HEAD to point to this branch (attached)
+        ofstream head(".git/HEAD", ios::trunc);
+        head << "ref: " << branchRef << "\n";
+        cout << "Switched to branch '" << target << "'\n";
+    } else {
+        // Treat as a commit hash (detached HEAD)
+        commitHash = target;
+        ofstream head(".git/HEAD", ios::trunc);
+        head << commitHash << "\n";
+        cout << "HEAD is now at " << commitHash.substr(0, 7) << "\n";
+    }
+
+    if (commitHash.empty()) {
+        cerr << "Error: '" << target << "' is not a branch or commit hash\n";
         return;
     }
 
+    // Read the commit to get its tree hash
+    auto commitData = readObject(commitHash);
+    if (commitData.empty()) { cerr << "Error: invalid commit\n"; return; }
 
-    string treeHash = writeTree(".");
+    size_t nullPos = 0;
+    while (nullPos < commitData.size() && commitData[nullPos] != '\0') nullPos++;
+    string content(commitData.begin() + nullPos + 1, commitData.end());
 
-    
-    string commitContent;
-    commitContent += "tree " + treeHash + "\n";
-
-    // parent commit SHA
-    ifstream headFile(".git/HEAD");
-    string refLine;
-    getline(headFile, refLine);
-    headFile.close();
-
-    string refPath = refLine.substr(5); // Skipping "ref: "
-    string headRefPath = ".git/" + refPath;
-
-    ifstream refFile(headRefPath);
-    if (refFile.is_open())
-    {
-        string parentHash;
-        getline(refFile, parentHash);
-        refFile.close();
-        commitContent += "parent " + parentHash + "\n";
+    string treeHash;
+    stringstream ss(content);
+    string line;
+    while (getline(ss, line)) {
+        if (line.rfind("tree ", 0) == 0) {
+            treeHash = line.substr(5);
+            break;
+        }
     }
 
-    
-    time_t now = time(nullptr);
-    char timeStr[100];
-    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S %z", localtime(&now));
+    if (treeHash.empty()) { cerr << "Error: could not find tree in commit\n"; return; }
 
-    commitContent += "author : <VaibhavGupta@gmail.com> " + string(timeStr) + "\n";
-    commitContent += "committer : <VaibhavGupta@gmail.com> " + string(timeStr) + "\n\n";
-    commitContent += message + "\n";
+    // Restore the working directory from the tree
+    // Only touch tracked files — don't delete untracked files
+    restoreTree(treeHash, ".");
 
-    
-    string commitObj = "commit " + to_string(commitContent.size()) + '\0' + commitContent;
-
-    
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<const unsigned char *>(commitObj.c_str()), commitObj.size(), hash);
-
-    stringstream ss;
-    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
-    {
-        ss << hex << setw(2) << setfill('0') << static_cast<unsigned int>(hash[i]);
-    }
-    string commitHash = ss.str();
-
-    // Writing the commit object to the .git/objects directory
-    string folder = commitHash.substr(0, 2);
-    string fileNamePart = commitHash.substr(2);
-    string folderPath = ".git/objects/" + folder;
-
-    if (!filesystem::exists(folderPath))
-    {
-        filesystem::create_directory(folderPath);
-    }
-
-    uLongf compressedSize = compressBound(commitObj.size());
-    vector<unsigned char> compressedBuffer(compressedSize);
-
-    int result = compress(compressedBuffer.data(), &compressedSize,
-                          reinterpret_cast<const Bytef *>(commitObj.data()), commitObj.size());
-    if (result != Z_OK)
-    {
-        cerr << "Error: Failed to compress commit object. Result code: " << result << "\n";
-        return;
-    }
-
-    compressedBuffer.resize(compressedSize);
-
-    // Write the compressed commit object to the file
-    ofstream outFile(folderPath + "/" + fileNamePart, ios::binary);
-    if (!outFile.is_open())
-    {
-        cerr << "Error: Failed to write commit object.\n";
-        return;
-    }
-
-    outFile.write(reinterpret_cast<const char *>(compressedBuffer.data()),
-                  static_cast<std::streamsize>(compressedSize));
-    outFile.close();
-
-    // Update the HEAD reference
-    ofstream refFileOut(headRefPath);
-    if (!refFileOut.is_open())
-    {
-        cerr << "Error: Failed to update HEAD reference.\n";
-        return;
-    }
-    refFileOut << commitHash << endl;
-    refFileOut.close();
-
-    //  Now Clearing the index file
-    ofstream indexFileOut(".git/index", ofstream::trunc);
-    indexFileOut.close();
-
-    cout << commitHash << endl;
+    // Clear index — working tree now matches this commit
+    writeIndex({});
 }
 
-// Checkout function
+// ─────────────────────────────────────────────
+// FIX 5: branch command
+//         mygit branch               → list branches
+//         mygit branch <name>        → create branch at HEAD
+//         mygit branch -d <name>     → delete branch
+// ─────────────────────────────────────────────
+void mygitBranch(const vector<string>& args) {
+    string headsDir = ".git/refs/heads";
 
+    if (args.empty()) {
+        // List all branches, mark current with *
+        string headRef = getHeadRef();
+        string currentBranch;
+        if (!headRef.empty() && headRef.rfind("refs/heads/", 0) == 0)
+            currentBranch = headRef.substr(string("refs/heads/").size());
 
+        if (!filesystem::exists(headsDir)) {
+            cout << "(no branches)\n"; return;
+        }
+        for (const auto& e : filesystem::directory_iterator(headsDir)) {
+            string name = e.path().filename().string();
+            cout << (name == currentBranch ? "* " : "  ") << name << "\n";
+        }
+        return;
+    }
 
-int main(int argc, char *argv[])
-{
-    
-    cout << std::unitbuf;
-    cerr << std::unitbuf;
+    if (args[0] == "-d" || args[0] == "--delete") {
+        if (args.size() < 2) { cerr << "Usage: mygit branch -d <name>\n"; return; }
+        string path = headsDir + "/" + args[1];
+        if (!filesystem::exists(path)) {
+            cerr << "Error: branch '" << args[1] << "' not found\n"; return;
+        }
+        // Prevent deleting current branch
+        string headRef = getHeadRef();
+        if (headRef == "refs/heads/" + args[1]) {
+            cerr << "Error: cannot delete the currently checked-out branch\n"; return;
+        }
+        filesystem::remove(path);
+        cout << "Deleted branch " << args[1] << "\n";
+        return;
+    }
 
-    if (argc < 2)
-    {
-        cerr << "No command provided.\n";
+    // Create new branch at current HEAD
+    string branchName = args[0];
+    string path = headsDir + "/" + branchName;
+    if (filesystem::exists(path)) {
+        cerr << "Error: branch '" << branchName << "' already exists\n"; return;
+    }
+
+    string currentCommit = getCurrentCommit();
+    if (currentCommit.empty()) {
+        cerr << "Error: no commits yet — cannot create a branch\n"; return;
+    }
+
+    ofstream f(path);
+    f << currentCommit << "\n";
+    cout << "Created branch '" << branchName
+         << "' at " << currentCommit.substr(0, 7) << "\n";
+}
+
+// ─────────────────────────────────────────────
+// switch — same as checkout for branches
+//          kept separate to match real Git UX
+// ─────────────────────────────────────────────
+void mygitSwitch(const string& branchName) {
+    string branchPath = ".git/refs/heads/" + branchName;
+    if (!filesystem::exists(branchPath)) {
+        cerr << "Error: branch '" << branchName << "' does not exist\n";
+        cerr << "Tip: use 'mygit branch " << branchName
+             << "' to create it first\n";
+        return;
+    }
+    mygitCheckout(branchName);
+}
+
+// ─────────────────────────────────────────────
+// status — show staged files vs working tree
+// ─────────────────────────────────────────────
+void mygitStatus() {
+    auto index = readIndex();
+    set<string> staged;
+    for (const auto& e : index) staged.insert(e.path);
+
+    if (staged.empty()) {
+        cout << "Nothing staged for commit.\n";
+    } else {
+        cout << "Changes to be committed:\n";
+        for (const auto& p : staged)
+            cout << "  staged: " << p << "\n";
+    }
+
+    // Check for modified unstaged files
+    cout << "\nUnstaged changes:\n";
+    bool anyUnstaged = false;
+    for (const auto& entry : filesystem::recursive_directory_iterator(".")) {
+        if (!entry.is_regular_file()) continue;
+        string p = entry.path().string();
+        if (p.find(".git") != string::npos) continue;
+        // normalise
+        if (p.size() >= 2 && p[0] == '.' && p[1] == '/')
+            p = p.substr(2);
+
+        string workingHash = createBlob(entry.path().string(), false);
+
+        bool inIndex = false;
+        for (const auto& e : index) {
+            if (e.path == p) {
+                inIndex = true;
+                if (e.hash != workingHash) {
+                    cout << "  modified: " << p << "\n";
+                    anyUnstaged = true;
+                }
+                break;
+            }
+        }
+        if (!inIndex && staged.find(p) == staged.end()) {
+            cout << "  untracked: " << p << "\n";
+            anyUnstaged = true;
+        }
+    }
+    if (!anyUnstaged) cout << "  (clean)\n";
+}
+
+// ─────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────
+int main(int argc, char* argv[]) {
+    cout << unitbuf;
+    cerr << unitbuf;
+
+    if (argc < 2) {
+        cerr << "Usage: mygit <command> [args]\n";
+        cerr << "Commands: init, add, commit, log, status, branch, "
+                "switch, checkout, write-tree, ls-tree, cat-file, hash-object\n";
         return EXIT_FAILURE;
     }
 
-    string command = argv[1];
+    string cmd = argv[1];
 
-    if (command == "init")
-    {
-        try
-        {
-            filesystem::create_directory(".git");
-            filesystem::create_directory(".git/objects");
-            filesystem::create_directory(".git/refs");
-            filesystem::create_directory(".git/refs/heads");
-
-            ofstream headFile(".git/HEAD");
-            if (headFile.is_open())
-            {
-                headFile << "ref: refs/heads/main\n";
-                headFile.close();
-            }
-            else
-            {
-                cerr << "Failed to create .git/HEAD file.\n";
-                return EXIT_FAILURE;
-            }
-
-            cout << "Initialized git directory\n";
-        }
-        catch (const std::filesystem::filesystem_error &e)
-        {
-            cerr << e.what() << '\n';
-            return EXIT_FAILURE;
-        }
-    }
-    else if (command == "cat-file")
-    {
-        if (argc <= 3)
-        {
-            cerr << "No hash provided.\n";
-            return EXIT_FAILURE;
-        }
-
-        string shaOfBlob = argv[3];
-        string folderName = shaOfBlob.substr(0, 2);
-        string fileName = shaOfBlob.substr(2);
-        string path = ".git/objects/" + folderName + "/" + fileName;
-
-        if (!filesystem::exists(path))
-        {
-            cerr << "Not a valid object name " << shaOfBlob << "\n";
-            return EXIT_FAILURE;
-        }
-
-        ifstream file(path, ios::binary);
-        if (!file.is_open())
-        {
-            cerr << "Error: Failed to open file.\n";
-            return EXIT_FAILURE;
-        }
-
-        file.seekg(0, ios::end);
-        long long sizeOfFile = file.tellg();
-        file.seekg(0, ios::beg);
-
-        if (sizeOfFile > 0)
-        {
-            
-            vector<Bytef> buffer(sizeOfFile);
-            file.read(reinterpret_cast<char *>(buffer.data()), sizeOfFile);
-            file.close();
-
-            if (file.fail())
-            {
-                cerr << "Error: Failed to read file.\n";
-                return EXIT_FAILURE;
-            }
-
-            
-            uLongf decompressedSize = buffer.size() * 100;
-            vector<Bytef> decompressedBuffer(decompressedSize);
-
-            int result = uncompress(decompressedBuffer.data(), &decompressedSize, buffer.data(), buffer.size());
-            if (result != Z_OK)
-            {
-                cerr << "Error: Failed to decompress data. Result code: " << result << "\n";
-                return EXIT_FAILURE;
-            }
-
-            
-            decompressedBuffer.resize(decompressedSize);
-
-            
-            if (string(argv[2]) == "-p")
-            {
-                
-                auto start = find(decompressedBuffer.begin(), decompressedBuffer.end(), '\0');
-                if (start != decompressedBuffer.end())
-                {
-                    ++start; // Move to the character after the null character
-                    for (auto it = start; it != decompressedBuffer.end(); ++it)
-                    {
-                        cout << *it;
-                    }
-                    cout << endl;
-                }
-            }
-            else if (string(argv[2]) == "-t")
-            {
-            
-                auto end = find(decompressedBuffer.begin(), decompressedBuffer.end(), ' ');
-                string type(decompressedBuffer.begin(), end);
-                cout << "Type: " << type << endl;
-            }
-            else if (string(argv[2]) == "-s")
-            {
-                // Extract size by reading until the first null character after the first space
-                auto spaceIt = find(decompressedBuffer.begin(), decompressedBuffer.end(), ' ');
-                if (spaceIt != decompressedBuffer.end())
-                {
-                    ++spaceIt; // Move to the start of the size
-                    auto nullIt = find(spaceIt, decompressedBuffer.end(), '\0');
-                    string sizeStr(spaceIt, nullIt);
-                    cout << "Size: " << sizeStr << endl;
-                }
-            }
-            else
-            {
-                cerr << "Invalid flag provided. Use -p, -t, or -s.\n";
-                return EXIT_FAILURE;
-            }
+    // ── init ──────────────────────────────────
+    if (cmd == "init") {
+        try {
+            filesystem::create_directories(".git/objects");
+            filesystem::create_directories(".git/refs/heads");
+            ofstream(".git/HEAD") << "ref: refs/heads/main\n";
+            cout << "Initialized empty MyGit repository in .git/\n";
+        } catch (const filesystem::filesystem_error& e) {
+            cerr << e.what() << "\n"; return EXIT_FAILURE;
         }
     }
 
-    else if (command == "hash-object")
-    {
-        if (argc == 2)
-        {
-            cerr << "No file provided.\n";
-            return EXIT_FAILURE;
-        }
-        else if (argc > 4)
-        {
-            cerr << "Error: Too many arguments\n";
-            return EXIT_FAILURE;
-        }
-        else
-        {
-            string fileName;
-            string flag;
-
-            if (argc == 3)
-            {
-                fileName = argv[2];
-                flag = "";
-            }
-            else
-            {
-                flag = argv[2];
-                fileName = argv[3];
-            }
-
-            string s = callCreatingBlobObject(fileName, flag);
-            cout << s << endl;
-        }
-    }
-    else if (command == "write-tree")
-    {
-        string treeHash = writeTree(".");
-        if (!treeHash.empty())
-        {
-            cout << treeHash << endl;
-        }
-        else
-        {
-            cerr << "Failed to write tree.\n";
-            return EXIT_FAILURE;
-        }
-    }
-    else if (command == "ls-tree")
-    {
-        if (argc < 3)
-        {
-            cerr << "No tree hash provided.\n";
-            return EXIT_FAILURE;
-        }
-
-        string flag = "";
-        string treeHash;
-
-        if (argc == 4)
-        {
-            flag = argv[2];
-            treeHash = argv[3];
-        }
-        else
-        {
-            treeHash = argv[2];
-        }
-
-        lsTree(treeHash, flag);
-    }
-    else if (command == "add")
-    {
-        if (argc < 3)
-        {
-            cerr << "No files provided to add.\n";
-            return EXIT_FAILURE;
-        }
-
+    // ── add ───────────────────────────────────
+    else if (cmd == "add") {
+        if (argc < 3) { cerr << "Usage: mygit add <file|directory|.>\n"; return EXIT_FAILURE; }
         vector<string> files;
-        for (int i = 2; i < argc; ++i)
-        {
-            files.push_back(argv[i]);
-        }
-
+        for (int i = 2; i < argc; ++i) files.push_back(argv[i]);
         mygitAdd(files);
     }
-    else if (command == "commit")
-    {
-        string message = "No commit message";
-        if (argc == 4 && string(argv[2]) == "-m")
-        {
-            message = argv[3];
-        }
-        else if (argc != 2)
-        {
-            cerr << "Usage: ./mygit commit -m \"Commit message\"\n";
-            return EXIT_FAILURE;
-        }
 
-        mygitCommit(message);
+    // ── commit ────────────────────────────────
+    else if (cmd == "commit") {
+        if (argc == 4 && string(argv[2]) == "-m") {
+            mygitCommit(argv[3]);
+        } else {
+            cerr << "Usage: mygit commit -m \"message\"\n"; return EXIT_FAILURE;
+        }
     }
-    // else if (command == "checkout")
-    // {
-    //     if (argc != 3)
-    //     {
-    //         cerr << "Usage: ./mygit checkout <commit_hash>\n";
-    //         return EXIT_FAILURE;
-    //     }
 
-    //     string commitHash = argv[2];
-    //     mygitCheckout(commitHash);
-    // }
-
-    else if (command == "log")
-    {
+    // ── log ───────────────────────────────────
+    else if (cmd == "log") {
         mygitLog();
     }
-    else
-    {
-        cerr << "Unknown command " << command << '\n';
-        return EXIT_FAILURE;
+
+    // ── status ────────────────────────────────
+    else if (cmd == "status") {
+        mygitStatus();
+    }
+
+    // ── branch ────────────────────────────────
+    else if (cmd == "branch") {
+        vector<string> args;
+        for (int i = 2; i < argc; ++i) args.push_back(argv[i]);
+        mygitBranch(args);
+    }
+
+    // ── switch ────────────────────────────────
+    else if (cmd == "switch") {
+        if (argc != 3) { cerr << "Usage: mygit switch <branch>\n"; return EXIT_FAILURE; }
+        mygitSwitch(argv[2]);
+    }
+
+    // ── checkout ──────────────────────────────
+    else if (cmd == "checkout") {
+        if (argc != 3) { cerr << "Usage: mygit checkout <branch|commit-hash>\n"; return EXIT_FAILURE; }
+        mygitCheckout(argv[2]);
+    }
+
+    // ── write-tree ────────────────────────────
+    else if (cmd == "write-tree") {
+        string h = writeTree(".");
+        if (!h.empty()) cout << h << "\n";
+    }
+
+    // ── ls-tree ───────────────────────────────
+    else if (cmd == "ls-tree") {
+        if (argc < 3) { cerr << "Usage: mygit ls-tree [--name-only] <hash>\n"; return EXIT_FAILURE; }
+        string flag = (argc == 4) ? argv[2] : "";
+        string hash = (argc == 4) ? argv[3] : argv[2];
+        lsTree(hash, flag);
+    }
+
+    // ── cat-file ──────────────────────────────
+    else if (cmd == "cat-file") {
+        if (argc != 4) { cerr << "Usage: mygit cat-file [-p|-t|-s] <hash>\n"; return EXIT_FAILURE; }
+        catFile(argv[2], argv[3]);
+    }
+
+    // ── hash-object ───────────────────────────
+    else if (cmd == "hash-object") {
+        if (argc < 3) { cerr << "Usage: mygit hash-object [-w] <file>\n"; return EXIT_FAILURE; }
+        bool write = (argc == 4 && string(argv[2]) == "-w");
+        string file = write ? argv[3] : argv[2];
+        string h = createBlob(file, write);
+        if (!h.empty()) cout << h << "\n";
+    }
+
+    else {
+        cerr << "Unknown command: " << cmd << "\n"; return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;
 }
-

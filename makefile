@@ -1,38 +1,61 @@
-# Compiler and Flags
-CXX = g++
+# ─────────────────────────────────────────────────────────
+# MyGit — Makefile
+# ─────────────────────────────────────────────────────────
+
+CXX      = g++
 CXXFLAGS = -Wall -std=c++23
 
-# OpenSSL paths
-OPENSSL_ROOT_DIR = /usr
-OPENSSL_INCLUDE_DIR = $(OPENSSL_ROOT_DIR)/include
-OPENSSL_LIB_DIR = $(OPENSSL_ROOT_DIR)/lib/x86_64-linux-gnu
-LIBS = -lssl -lcrypto -lz
+# OpenSSL — adjust paths for your OS:
+#   macOS (Homebrew):  /opt/homebrew/opt/openssl@3
+#   Ubuntu (apt):      /usr  (after: sudo apt install libssl-dev)
+#   Ubuntu (node):     /usr/include/node  (no libssl-dev needed)
+OPENSSL_INCLUDE = /usr/include/node
 
-# Source and target definitions
-TARGET = mygit
-SRC_DIR = .  # Current directory as source
-SOURCES = $(shell find $(SRC_DIR) -name '*.cpp')
-OBJECTS = $(SOURCES:.cpp=.o)
+# Linker — use whichever is present on your system
+#   Ubuntu apt:   -lssl -lcrypto
+#   Ubuntu node:  explicit .so paths (see LIBS_DIRECT below)
+#   macOS brew:   -L$(OPENSSL_ROOT)/lib -lssl -lcrypto
 
-# Default target to build the executable
+LIBS_APT    = -lssl -lcrypto -lz
+LIBS_DIRECT = /usr/lib/x86_64-linux-gnu/libssl.so.3 \
+              /usr/lib/x86_64-linux-gnu/libcrypto.so.3 \
+              -lz
+
+TARGET  = mygit
+SOURCES = mygit.cpp
+
+# ── default build (tries apt-style first, falls back to direct) ──
 all: $(TARGET)
 
-# Link object files to create the executable
-$(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) -o $(TARGET) -L$(OPENSSL_LIB_DIR) $(LIBS)
+$(TARGET): $(SOURCES)
+	$(CXX) $(CXXFLAGS) -I$(OPENSSL_INCLUDE) $^ -o $@ $(LIBS_APT) || \
+	$(CXX) $(CXXFLAGS) -I$(OPENSSL_INCLUDE) $^ -o $@ $(LIBS_DIRECT)
 
-# Compile source files to object files
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -I$(OPENSSL_INCLUDE_DIR) -c $< -o $@
+# ── convenience: run the full demo ───────────────────────────────
+demo: $(TARGET)
+	@bash demo.sh
 
-# Clean build files
+# ── clean ────────────────────────────────────────────────────────
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(TARGET)
 
-# Additional help command
+# ── help ─────────────────────────────────────────────────────────
 help:
+	@echo "Commands:"
+	@echo "  make          Build mygit"
+	@echo "  make demo     Run demo workflow"
+	@echo "  make clean    Remove binary"
+	@echo ""
 	@echo "Usage:"
-	@echo "  ./mygit <command>  Build and run the executable with specified command"
-	@echo "  make               Build the project"
-	@echo "  make clean         Remove build artifacts"
-	@echo "  make help          Show this help message"
+	@echo "  ./mygit init"
+	@echo "  ./mygit add <file|dir|.>"
+	@echo "  ./mygit commit -m \"message\""
+	@echo "  ./mygit log"
+	@echo "  ./mygit status"
+	@echo "  ./mygit branch [name] [-d name]"
+	@echo "  ./mygit switch <branch>"
+	@echo "  ./mygit checkout <branch|commit-hash>"
+	@echo "  ./mygit write-tree"
+	@echo "  ./mygit ls-tree [--name-only] <hash>"
+	@echo "  ./mygit cat-file [-p|-t|-s] <hash>"
+	@echo "  ./mygit hash-object [-w] <file>"
